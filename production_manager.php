@@ -15,17 +15,36 @@ date_default_timezone_set('Asia/Kuala_Lumpur');
 $firebaseUrl = "https://unity-sql-app-default-rtdb.asia-southeast1.firebasedatabase.app/ProductionData.json";
 $logsUrl = "https://unity-sql-app-default-rtdb.asia-southeast1.firebasedatabase.app/ProductionLogs.json";
 
-function firebaseRequest($url, $method = 'GET',$data = null) {
+function firebaseRequest($url, $method = 'GET', $data = null) {
+    if (empty($url)) return ['error' => 'URL is empty'];
+
     $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST,$method);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+
     if ($data !== null) {
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        $jsonPayload = json_encode($data);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonPayload);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($jsonPayload)
+        ]);
     }
+
     $response = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
+
+    if ($response === false) {
+        error_log("[Firebase cURL Error] Code $httpCode: $curlError");
+        return null;
+    }
+
     return json_decode($response, true);
 }
 
