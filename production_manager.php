@@ -31,7 +31,7 @@ function firebaseRequest($url, $method = 'GET', $data = null) {
     return json_decode($response, true);
 }
 
-function finalizeCurrentBatch($logsUrl, $batchId, $produced, $demand, $status = 'INTERRUPTED') {
+function closeBatch($logsUrl, $batchId, $produced, $status) {
     if (empty($logsUrl) || empty($batchId)) return;
     $batchItemUrl = str_replace('.json', '/' . $batchId . '.json', $logsUrl);
 
@@ -43,7 +43,7 @@ function finalizeCurrentBatch($logsUrl, $batchId, $produced, $demand, $status = 
     firebaseRequest($batchItemUrl, 'PATCH', $patchData);
 }
 
-function createNewBatch($logsUrl, $demand) {
+function createBatch($logsUrl, $demand) {
     if (empty($logsUrl)) return null;
 
     $batchData = [
@@ -55,7 +55,7 @@ function createNewBatch($logsUrl, $demand) {
     ];
 
     $response = firebaseRequest($logsUrl, 'POST', $batchData);
-    return $response['name'] ?? null; // Returns the generated Firebase Push ID
+    return $response['name'] ?? null;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -70,13 +70,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $oldProduced = isset($currentData['Produced']) ? (int)$currentData['Produced'] : 0;
         $oldBatchId  = $currentData['active_batch_id'] ?? '';
 
-        // If an active incomplete order existed, finalize it as INTERRUPTED
-        if (!empty($oldBatchId) && $oldProduced < $oldDemand) {
-            finalizeCurrentBatch($logsUrl, $oldBatchId, $oldProduced, $oldDemand, 'INTERRUPTED');
-        }
+        $newBatchId = $oldBatchId;
 
-        // Create new batch record in logs
-        $newBatchId = createNewBatch($logsUrl, $newDemand);
+        // RULE UPDATE: If zero units were produced, reuse and update the active batch's start_time & demand
+        if (!empty($oldBatchId) && $oldProduced === 0) {
+            $batchItemUrl = str_replace('.json', '/' . $oldBatchId . '.json', $logsUrl);
+            $updateData = [
+                'start_time' => date("Y-m-d H:i:s"),
+                'demand'     => $newDemand,
+                'produced'   => 0,
+                'status'     => 'IN_PROGRESS'
+            ];
+            firebaseRequest($batchItemUrl, 'PATCH', $updateData);
+        } else {
+            // If items were already produced from the previous batch, close it first
+            if (!empty($oldBatchId) && $oldProduced > 0 && $oldProduced < $oldDemand) {
+                closeBatch($logsUrl, $oldBatchId, $oldProduced, 'INTERRUPTED');
+            }
+            // Create a brand new batch entry with immediate timestamp and demand
+            $newBatchId = createBatch($logsUrl, $newDemand);
+        }
 
         $payload = [
             'Demand'          => $newDemand,
@@ -100,7 +113,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!empty($oldBatchId)) {
             $finalStatus = ($oldDemand > 0 && $oldProduced >= $oldDemand) ? 'COMPLETED' : 'INTERRUPTED';
-            finalizeCurrentBatch($logsUrl, $oldBatchId, $oldProduced, $oldDemand, $finalStatus);
+            closeBatch($logsUrl, $oldBatchId, $oldProduced, $finalStatus);
         }
 
         $payload = [
@@ -134,17 +147,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $batchId     = $data['active_batch_id'] ?? '';
         $currentTime = time();
 
-        // Check if finished
         $isCompleted = ($demand > 0 && $produced >= $demand);
-        if ($isCompleted && !$isLogged) {
-            $isLogged = true;
-            firebaseRequest($firebaseUrl, 'PATCH', ['logged' => true]);
-            finalizeCurrentBatch($logsUrl, $batchId, $produced, $demand, 'COMPLETED');
+
+        // Keep active batch produced count synchronized without altering start_time
+        if (!empty($batchId)) {
+            $batchItemUrl = str_replace('.json', '/' . $batchId . '.json', $logsUrl);
+
+            if ($isCompleted && !$isLogged) {
+                $isLogged = true;
+                firebaseRequest($firebaseUrl, 'PATCH', ['logged' => true]);
+                closeBatch($logsUrl, $batchId, $produced, 'COMPLETED');
+            } else if (!$isCompleted && $produced > 0) {
+                firebaseRequest($batchItemUrl, 'PATCH', ['produced' => (int)$produced]);
+            }
         }
 
-        // 300-second Inactivity Timeout
+        // Inactivity timeout (300 seconds)
         if ($produced > 0 && !$isLogged && ($currentTime - $lastUpdated >= 300)) {
-            finalizeCurrentBatch($logsUrl, $batchId, $produced, $demand, 'INTERRUPTED');
+            if (!empty($batchId)) {
+                closeBatch($logsUrl, $batchId, $produced, 'INTERRUPTED');
+            }
 
             $resetPayload = [
                 'Demand'          => 0,
@@ -162,7 +184,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $mpu      = '00:00';
         }
 
-        // Parse logs and calculate cumulative total
         $logsData = firebaseRequest($logsUrl, 'GET');
         $logsList = [];
         $cumulative = 0;
