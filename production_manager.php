@@ -16,91 +16,136 @@ $firebaseUrl = "https://unity-sql-app-default-rtdb.asia-southeast1.firebasedatab
 $logsUrl = "https://unity-sql-app-default-rtdb.asia-southeast1.firebasedatabase.app/ProductionLogs.json";
 
 function firebaseRequest($url, $method = 'GET', $data = null) {
-    if (empty($url)) return ['error' => 'URL is empty'];
+    if (empty($url)) return null;
 
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    $options = [
+        'http' => [
+            'method'        => $method,
+            'ignore_errors' => true,
+            'timeout'       => 10,
+            'header'        => "Content-Type: application/json\r\n"
+        ],
+        'ssl' => [
+            'verify_peer'      => false,
+            'verify_peer_name' => false
+        ]
+    ];
 
     if ($data !== null) {
-        $jsonPayload = json_encode($data);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonPayload);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-            'Content-Length: ' . strlen($jsonPayload)
-        ]);
+        $content = json_encode($data);
+        $options['http']['content'] = $content;
+        $options['http']['header'] .= "Content-Length: " . strlen($content) . "\r\n";
     }
 
-    $response = curl_exec($ch);
-    $curlError = curl_error($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
+    $context = stream_context_create($options);
+    $response = @file_get_contents($url, false, $context);
 
     if ($response === false) {
-        error_log("[Firebase cURL Error] Code $httpCode: $curlError");
         return null;
     }
 
     return json_decode($response, true);
 }
 
-function addProductionLog($logsUrl,$producedCount, $isInterrupted = false) {$timestamp = date("Y-m-d H:i:s");
-    $producedDisplay =$isInterrupted ? $producedCount . "*" : (string)$producedCount;
-    
-    $logEntry = [
-        'timestamp' => $timestamp,
-        'produced'  => $producedDisplay
+function closeBatch($logsUrl, $batchId, $produced, $status) {
+    if (empty($logsUrl) || empty($batchId)) return;
+    $batchItemUrl = str_replace('.json', '/' . $batchId . '.json', $logsUrl);
+
+    $patchData = [
+        'produced' => (int)$produced,
+        'end_time' => date("Y-m-d H:i:s"),
+        'status'   => $status
     ];
-    
-    firebaseRequest($logsUrl, 'POST',$logEntry);
+    firebaseRequest($batchItemUrl, 'PATCH', $patchData);
+}
+
+function createBatch($logsUrl, $demand) {
+    if (empty($logsUrl)) return null;
+
+    $batchData = [
+        'start_time' => date("Y-m-d H:i:s"),
+        'end_time'   => '-',
+        'demand'     => (int)$demand,
+        'produced'   => 0,
+        'status'     => 'IN_PROGRESS'
+    ];
+
+    $response = firebaseRequest($logsUrl, 'POST', $batchData);
+    return $response['name'] ?? null;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json');
-    $action =$_POST['action'] ?? '';
+    $action = $_POST['action'] ?? '';
 
-    if ($action === 'set_demand') {$newDemand = isset($_POST['demand']) ? (int)$_POST['demand'] : 0;
+    if ($action === 'set_demand') {
+        $newDemand = isset($_POST['demand']) ? (int)$_POST['demand'] : 0;
         
-        $currentData = firebaseRequest($firebaseUrl, 'GET');$oldDemand   = isset($currentData['Demand']) ? (int)$currentData['Demand'] : null;
+        $currentData = firebaseRequest($firebaseUrl, 'GET');
+        $oldDemand   = isset($currentData['Demand']) ? (int)$currentData['Demand'] : 0;
         $oldProduced = isset($currentData['Produced']) ? (int)$currentData['Produced'] : 0;
+        $oldBatchId  = $currentData['active_batch_id'] ?? '';
 
-        if ($oldProduced > 0 && ($oldDemand === null || $oldProduced <$oldDemand)) {
-            addProductionLog($logsUrl,$oldProduced, true);
+        $newBatchId = $oldBatchId;
+
+        // If zero units were produced, reuse and update the active batch in place
+        if (!empty($oldBatchId) && $oldProduced === 0) {
+            $batchItemUrl = str_replace('.json', '/' . $oldBatchId . '.json', $logsUrl);
+            $updateData = [
+                'start_time' => date("Y-m-d H:i:s"),
+                'demand'     => $newDemand,
+                'produced'   => 0,
+                'status'     => 'IN_PROGRESS'
+            ];
+            firebaseRequest($batchItemUrl, 'PATCH', $updateData);
+        } else {
+            if (!empty($oldBatchId) && $oldProduced > 0 && $oldProduced < $oldDemand) {
+                closeBatch($logsUrl, $oldBatchId, $oldProduced, 'INTERRUPTED');
+            }
+            $newBatchId = createBatch($logsUrl, $newDemand);
         }
 
         $payload = [
-            'Demand'       => $newDemand,
-            'Produced'     => 0,
-            'last_updated' => time(),
-            'logged'       => false,
-            'mpu'          => '00:00'
+            'Demand'          => $newDemand,
+            'Produced'        => 0,
+            'last_updated'    => time(),
+            'logged'          => false,
+            'mpu'             => '00:00',
+            'active_batch_id' => $newBatchId
         ];
-        firebaseRequest($firebaseUrl, 'PATCH',$payload);
+        firebaseRequest($firebaseUrl, 'PATCH', $payload);
 
-        echo json_encode(['status' => 'success', 'demand' => $newDemand]);
+        echo json_encode(['status' => 'success', 'demand' => $newDemand, 'batch_id' => $newBatchId]);
         exit;
     }
 
-    if ($action === 'reset_system') {$currentData = firebaseRequest($firebaseUrl, 'GET');$oldDemand   = isset($currentData['Demand']) ? (int)$currentData['Demand'] : null;
+    if ($action === 'reset_system') {
+        $currentData = firebaseRequest($firebaseUrl, 'GET');
+        $oldDemand   = isset($currentData['Demand']) ? (int)$currentData['Demand'] : 0;
         $oldProduced = isset($currentData['Produced']) ? (int)$currentData['Produced'] : 0;
+        $oldBatchId  = $currentData['active_batch_id'] ?? '';
 
-        if ($oldProduced > 0 && ($oldDemand === null || $oldProduced <$oldDemand)) {
-            addProductionLog($logsUrl,$oldProduced, true);
+        if (!empty($oldBatchId)) {
+            $finalStatus = ($oldDemand > 0 && $oldProduced >= $oldDemand) ? 'COMPLETED' : 'INTERRUPTED';
+            closeBatch($logsUrl, $oldBatchId, $oldProduced, $finalStatus);
         }
 
         $payload = [
-            'Demand'       => null,
-            'Produced'     => 0,
-            'last_updated' => time(),
-            'logged'       => false,
-            'mpu'          => '00:00'
+            'Demand'          => 0,
+            'Produced'        => 0,
+            'last_updated'    => time(),
+            'logged'          => false,
+            'mpu'             => '00:00',
+            'active_batch_id' => ''
         ];
-        firebaseRequest($firebaseUrl, 'PUT',$payload);
+        firebaseRequest($firebaseUrl, 'PUT', $payload);
 
+        echo json_encode(['status' => 'success']);
+        exit;
+    }
+
+    if ($action === 'clear_logs') {
+        firebaseRequest($logsUrl, 'DELETE');
         echo json_encode(['status' => 'success']);
         exit;
     }
@@ -108,54 +153,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'get_status') {
         $data = firebaseRequest($firebaseUrl, 'GET');
 
-        $demand      = isset($data['Demand']) ? (int)$data['Demand'] : null;
+        $demand      = isset($data['Demand']) ? (int)$data['Demand'] : 0;
         $produced    = isset($data['Produced']) ? (int)$data['Produced'] : 0;
-        $lastUpdated = isset($data['last_updated']) ? (int)$data['last_updated'] : time();$isLogged    = isset($data['logged']) ? (bool)$data['logged'] : false;
-        $mpu         = isset($data['mpu']) ? (string)$data['mpu'] : '00:00';$currentTime = time();
+        $lastUpdated = isset($data['last_updated']) ? (int)$data['last_updated'] : time();
+        $isLogged    = isset($data['logged']) ? (bool)$data['logged'] : false;
+        $mpu         = isset($data['mpu']) ? (string)$data['mpu'] : '00:00';
+        $batchId     = $data['active_batch_id'] ?? '';
+        $currentTime = time();
 
-        if ($produced > 0 && ($currentTime -$lastUpdated >= 300)) {
-            $isInterrupted = ($demand === null || $produced <$demand);
-            addProductionLog($logsUrl, $produced,$isInterrupted);
+        $isCompleted = ($demand > 0 && $produced >= $demand);
+
+        if (!empty($batchId)) {
+            $batchItemUrl = str_replace('.json', '/' . $batchId . '.json', $logsUrl);
+
+            if ($isCompleted && !$isLogged) {
+                $isLogged = true;
+                firebaseRequest($firebaseUrl, 'PATCH', ['logged' => true]);
+                closeBatch($logsUrl, $batchId, $produced, 'COMPLETED');
+            } else if (!$isCompleted && $produced > 0) {
+                firebaseRequest($batchItemUrl, 'PATCH', ['produced' => (int)$produced]);
+            }
+        }
+
+        // Inactivity timeout (300 seconds)
+        if ($produced > 0 && !$isLogged && ($currentTime - $lastUpdated >= 300)) {
+            if (!empty($batchId)) {
+                closeBatch($logsUrl, $batchId, $produced, 'INTERRUPTED');
+            }
 
             $resetPayload = [
-                'Demand'       => null,
-                'Produced'     => 0,
-                'last_updated' => $currentTime,
-                'logged'       => false,
-                'mpu'          => '00:00'
+                'Demand'          => 0,
+                'Produced'        => 0,
+                'last_updated'    => $currentTime,
+                'logged'          => false,
+                'mpu'             => '00:00',
+                'active_batch_id' => ''
             ];
-            firebaseRequest($firebaseUrl, 'PUT',$resetPayload);
+            firebaseRequest($firebaseUrl, 'PUT', $resetPayload);
 
-            $demand   = null;
+            $demand   = 0;
             $produced = 0;
             $isLogged = false;
             $mpu      = '00:00';
         }
 
-        $isCompleted = ($demand !== null &&$demand > 0 && $produced >=$demand);
-        if ($isCompleted && !$isLogged) {
-            firebaseRequest($firebaseUrl, 'PATCH', ['logged' => true]);
-            addProductionLog($logsUrl,$produced, false);
-        }
-
-        // Retrieve historical logs and calculate Cumulative Produced (Logs Total + Active Produced)
         $logsData = firebaseRequest($logsUrl, 'GET');
-        $logsList = [];$cumulative = 0;
+        $logsList = [];
+        $cumulative = 0;
 
         if (is_array($logsData)) {
-            foreach ($logsData as $key =>$entry) {
-                if (is_array($entry) && isset($entry['timestamp'])) {
-                    $logsList[] =$entry;
-
-                    // Strip interruption asterisk (*) for raw sum
-                    $rawCount = (int)str_replace('*', '',$entry['produced'] ?? '0');
-                    $cumulative +=$rawCount;
+            foreach ($logsData as $id => $entry) {
+                if (is_array($entry) && isset($entry['start_time'])) {
+                    $entry['id'] = $id;
+                    $logsList[] = $entry;
+                    $cumulative += (int)($entry['produced'] ?? 0);
                 }
             }
         }
-
-        // Add currently active batch count
-        $cumulative +=$produced;
 
         echo json_encode([
             'status'     => 'success',
@@ -186,13 +240,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         input[type="number"] { width: 100%; padding: 10px; border-radius: 4px; border: 1px solid #333; background: #2a2a2a; color: #fff; box-sizing: border-box; }
         .btn { width: 100%; padding: 10px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
         .btn-primary { background: #007bff; color: white; }
+        .btn-success { background: #28a745; color: white; }
         .btn-danger { background: #dc3545; color: white; }
         .stats { margin-top: 15px; padding: 15px; background: #2a2a2a; border-radius: 6px; font-size: 16px; }
         .completed-banner { display: none; margin-top: 15px; padding: 15px; background: #28a745; color: white; border-radius: 6px; font-weight: bold; text-align: center; font-size: 16px; }
         .alert-toast { display: none; margin-top: 15px; padding: 10px; background: #17a2b8; color: white; border-radius: 4px; text-align: center; font-weight: bold; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #333; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #333; }
         th { background: #2a2a2a; }
+        .header-action { display: flex; justify-content: space-between; align-items: center; }
+        .action-buttons { display: flex; gap: 8px; }
+        .btn-sm { width: auto; padding: 6px 12px; margin-bottom: 0; font-size: 13px; }
+        .status-badge { padding: 3px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+        .status-in_progress { background: #ffc107; color: #000; }
+        .status-completed { background: #28a745; color: #fff; }
+        .status-interrupted { background: #dc3545; color: #fff; }
     </style>
 </head>
 <body>
@@ -211,7 +273,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <div id="orderNotification" class="alert-toast">📦 Target updated successfully!</div>
 
         <div class="stats">
-            <p><strong>Target Demand:</strong> <span id="displayDemand">Not Set</span></p>
+            <p><strong>Target Demand:</strong> <span id="displayDemand">0</span></p>
             <p><strong>Currently Produced:</strong> <span id="displayProduced">0</span></p>
             <p><strong>Cumulative Produced:</strong> <span id="displayCumulative">0</span></p>
             <p><strong>Minutes per Unit (MPU):</strong> <span id="displayMpu">00:00</span></p>
@@ -220,23 +282,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <div id="completionBanner" class="completed-banner">🎉 Process Has Been Completed!</div>
     </div>
 
-    <div class="card" style="flex-grow: 1; max-width: 500px;">
-        <h2>Production Logs</h2>
+    <div class="card" style="flex-grow: 1; max-width: 680px;">
+        <div class="header-action">
+            <h2>Live Production Batches</h2>
+            <div class="action-buttons">
+                <button class="btn btn-success btn-sm" onclick="exportCSV()">Export CSV</button>
+                <button class="btn btn-danger btn-sm" onclick="clearLogs()">Clear Logs</button>
+            </div>
+        </div>
         <table>
             <thead>
                 <tr>
-                    <th>Timestamp (MYT)</th>
+                    <th>Start Time (MYT)</th>
+                    <th>End Time (MYT)</th>
+                    <th>Demand</th>
                     <th>Produced</th>
+                    <th>Status</th>
                 </tr>
             </thead>
             <tbody id="logsTableBody">
-                <tr><td colspan="2">No logs recorded yet.</td></tr>
+                <tr><td colspan="5">No logs recorded yet.</td></tr>
             </tbody>
         </table>
     </div>
 </div>
 
 <script>
+let currentLogs = [];
+
 function updateDemand() {
     const input = document.getElementById('demandInput');
     const demandVal = input.value;
@@ -265,6 +338,42 @@ function resetSystem() {
     fetch('production_manager.php', { method: 'POST', body: formData }).then(() => checkStatus());
 }
 
+function clearLogs() {
+    if (!confirm("Are you sure you want to delete all production logs?")) return;
+
+    const formData = new FormData();
+    formData.append('action', 'clear_logs');
+    fetch('production_manager.php', { method: 'POST', body: formData })
+        .then(res => res.json())
+        .then(data => {
+            if (data.status === 'success') {
+                checkStatus();
+            }
+        });
+}
+
+function exportCSV() {
+    if (!currentLogs || currentLogs.length === 0) {
+        return alert("No logs available to export.");
+    }
+
+    let csvContent = "data:text/csv;charset=utf-8,Start Time,End Time,Demand,Produced,Status\n";
+
+    currentLogs.forEach(log => {
+        csvContent += `"${log.start_time}","${log.end_time}","${log.demand}","${log.produced}","${log.status}"\n`;
+    });
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    const today = new Date().toISOString().split('T')[0];
+    
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `production_batches_${today}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
 function checkStatus() {
     const formData = new FormData();
     formData.append('action', 'get_status');
@@ -272,8 +381,8 @@ function checkStatus() {
     fetch('production_manager.php', { method: 'POST', body: formData })
         .then(res => res.json())
         .then(data => {
-            if (data.status === 'success') {
-                document.getElementById('displayDemand').innerText = (data.demand !== null) ? data.demand : "Not Set";
+            if (data && data.status === 'success') {
+                document.getElementById('displayDemand').innerText = (data.demand !== undefined && data.demand !== null) ? data.demand : 0;
                 document.getElementById('displayProduced').innerText = data.produced;
                 document.getElementById('displayCumulative').innerText = (data.cumulative !== undefined) ? data.cumulative : 0;
                 
@@ -282,13 +391,22 @@ function checkStatus() {
 
                 document.getElementById('completionBanner').style.display = data.completed ? 'block' : 'none';
 
+                currentLogs = data.logs || [];
+
                 const tableBody = document.getElementById('logsTableBody');
-                if (data.logs && data.logs.length > 0) {
-                    tableBody.innerHTML = data.logs.map(log => 
-                        `<tr><td>${log.timestamp}</td><td>${log.produced}</td></tr>`
-                    ).join('');
+                if (currentLogs.length > 0) {
+                    tableBody.innerHTML = currentLogs.map(log => {
+                        const statusClass = 'status-' + (log.status || 'in_progress').toLowerCase();
+                        return `<tr>
+                            <td>${log.start_time}</td>
+                            <td>${log.end_time}</td>
+                            <td>${log.demand}</td>
+                            <td>${log.produced}</td>
+                            <td><span class="status-badge ${statusClass}">${log.status}</span></td>
+                        </tr>`;
+                    }).join('');
                 } else {
-                    tableBody.innerHTML = '<tr><td colspan="2">No logs recorded yet.</td></tr>';
+                    tableBody.innerHTML = '<tr><td colspan="5">No logs recorded yet.</td></tr>';
                 }
             }
         })
