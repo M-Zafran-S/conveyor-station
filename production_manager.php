@@ -18,6 +18,7 @@ $logsUrl = "https://unity-sql-app-default-rtdb.asia-southeast1.firebasedatabase.
 function firebaseRequest($url, $method = 'GET', $data = null) {
     if (empty($url)) return null;
 
+<<<<<<< HEAD
     $options = [
         'http' => [
             'method'        => $method,
@@ -31,6 +32,12 @@ function firebaseRequest($url, $method = 'GET', $data = null) {
         ]
     ];
 
+=======
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+>>>>>>> a3bc2f908b713859889bd667ae932f382202fe98
     if ($data !== null) {
         $content = json_encode($data);
         $options['http']['content'] = $content;
@@ -88,7 +95,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $newBatchId = $oldBatchId;
 
+<<<<<<< HEAD
         // If zero units were produced, reuse and update the active batch in place
+=======
+        // RULE UPDATE: If zero units were produced, reuse and update the active batch's start_time & demand
+>>>>>>> a3bc2f908b713859889bd667ae932f382202fe98
         if (!empty($oldBatchId) && $oldProduced === 0) {
             $batchItemUrl = str_replace('.json', '/' . $oldBatchId . '.json', $logsUrl);
             $updateData = [
@@ -99,9 +110,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ];
             firebaseRequest($batchItemUrl, 'PATCH', $updateData);
         } else {
+<<<<<<< HEAD
             if (!empty($oldBatchId) && $oldProduced > 0 && $oldProduced < $oldDemand) {
                 closeBatch($logsUrl, $oldBatchId, $oldProduced, 'INTERRUPTED');
             }
+=======
+            // If items were already produced from the previous batch, close it first
+            if (!empty($oldBatchId) && $oldProduced > 0 && $oldProduced < $oldDemand) {
+                closeBatch($logsUrl, $oldBatchId, $oldProduced, 'INTERRUPTED');
+            }
+            // Create a brand new batch entry with immediate timestamp and demand
+>>>>>>> a3bc2f908b713859889bd667ae932f382202fe98
             $newBatchId = createBatch($logsUrl, $newDemand);
         }
 
@@ -163,6 +182,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $isCompleted = ($demand > 0 && $produced >= $demand);
 
+<<<<<<< HEAD
+=======
+        // Keep active batch produced count synchronized without altering start_time
+>>>>>>> a3bc2f908b713859889bd667ae932f382202fe98
         if (!empty($batchId)) {
             $batchItemUrl = str_replace('.json', '/' . $batchId . '.json', $logsUrl);
 
